@@ -60,10 +60,17 @@
 需要安装 Docker（含 Compose 插件），在项目根目录执行：
 
 ```bash
-docker compose up -d --build
+docker compose up --build
 ```
 
-该命令会自动完成：构建镜像 → 安装全部依赖 → 启动 API（容器内 uvicorn 直接拉起，无数据库等额外初始化步骤）。
+该命令会自动完成：构建镜像 → 安装全部依赖 → 前台启动 API（容器内 uvicorn 直接拉起，
+无数据库等额外初始化步骤）。服务默认监听 **http://localhost:8000**，按 `Ctrl+C` 停止。
+
+希望在后台运行时改用：
+
+```bash
+docker compose up -d --build
+```
 
 停止 / 查看日志：
 
@@ -185,6 +192,12 @@ curl -X POST http://localhost:8000/api/v1/impose \
 在 `/api/v1/impose` 的**相同分帖、末帖补空白与左/右装订页序规则**之上，为每个页位补充
 机台落版所需的纸面尺寸、左上角坐标与旋转角度。本地访问地址
 `http://localhost:8000/api/v1/impose/press-layout`（改了 `HOST_PORT` 则对应替换端口）。
+
+页位几何由统一模块 `app/press_geometry.py` 提供，四个接口共用同一套**双向坐标变换**：
+装订方向与长/短边翻转决定每个**实际槽位**上的页码、槽位原点与 `0°/180°` 旋转；
+`press-layout` 据此生成页位，`locate-defects` 用逆变换把纸面点还原为阅读方向页内点，
+`ink-zones` 与 `trim-safety` 用正变换把页内矩形映射为纸面矩形。中缝与空白页位仍按
+各接口既有语义处理（中缝单独标记 / 空白跳过），各接口响应字段不变。
 
 ### 请求
 
@@ -1415,6 +1428,7 @@ pytest -q
 .
 ├── app/
 │   ├── __init__.py
+│   ├── press_geometry.py # 页位几何：装订/翻转决定的实际槽位页码、槽位原点与 0°/180° 双向坐标变换（press-layout / locate-defects / ink-zones / trim-safety 共用）
 │   ├── imposition.py   # 拼版核心算法（分帖 + 帖内拼版 + 机台版面 + 瑕疵定位 + 墨区着墨面积 + 外裁/折缝安全检查 + 订针计划 + 原纸备料 + 骑马订爬移补偿）
 │   ├── proof.py        # 双面拼版校样 PDF 生成（沿用机台版面结果）
 │   ├── fonts/          # 校样 PDF 嵌入的子集化中文字体

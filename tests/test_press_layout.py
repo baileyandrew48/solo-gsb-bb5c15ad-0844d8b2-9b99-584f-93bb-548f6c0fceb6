@@ -88,6 +88,24 @@ def test_zero_gutter_right_slot_x_equals_page_width():
     assert sheet["front"]["right"]["x_mm"] == 148.5
 
 
+def test_short_flip_back_with_gutter_slot_origins():
+    # 短边背面 + 中缝：槽位保持、旋转 180；右槽原点 = 页宽 + 中缝
+    result = press_layout(4, 1, "left", 210.0, 297.0, 10.0, "short")
+    sheet = result["signatures"][0]["sheets"][0]
+    assert _slot(sheet["back"]["left"]) == (2, 0.0, 0.0, 180)
+    assert _slot(sheet["back"]["right"]) == (3, 220.0, 0.0, 180)
+    # 正面仍为 0°
+    assert sheet["front"]["left"]["rotation_deg"] == 0
+
+
+def test_long_flip_back_swap_right_binding():
+    # 右装订 long 背面：拼版背面 (3,2) 互换 -> 左槽 2、右槽 3，旋转 0
+    result = press_layout(4, 1, "right", 100.0, 100.0, 0.0, "long")
+    sheet = result["signatures"][0]["sheets"][0]
+    assert _slot(sheet["back"]["left"]) == (2, 0.0, 0.0, 0)
+    assert _slot(sheet["back"]["right"]) == (3, 100.0, 0.0, 0)
+
+
 def test_invalid_duplex_flip_raises():
     with pytest.raises(ValueError):
         press_layout(4, 1, "left", 210.0, 297.0, 0.0, "side")  # type: ignore[arg-type]

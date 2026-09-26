@@ -326,6 +326,50 @@ def test_invalid_safety_distances_raise():
             _trim([], **kwargs)
 
 
+def test_short_flip_back_asymmetric_rect_keeps_dimensions():
+    # 短边背面非对称矩形回归：宽 30、高 70，180° 映射后宽高不交换。
+    # 背左 = 第 2 页（x=0、180°）：
+    # 页内 (10,20,30,70) -> 纸面 (60,10,30,70)；右缘 90 越过左槽折缝安全线 95?
+    # 折缝线 100、fold=5 -> 右缘安全线 95；90 <= 95 合格；顶边 10 恰好贴线合格
+    result = _trim([(2, [(10, 20, 30, 70)])], duplex_flip="short")
+    assert result["violations"] == []
+    # 页内 (5,20,30,70) -> 纸面 (65,10,30,70)，右缘 95 恰好贴折缝安全线，合格
+    result = _trim([(2, [(5, 20, 30, 70)])], duplex_flip="short")
+    assert result["violations"] == []
+    # 页内 (0,20,30,70) -> 纸面 (70,10,30,70)，右缘 100 越过 95 记 fold；
+    # 纸面矩形必须保持宽 30、高 70（不交换）
+    result = _trim([(2, [(0, 20, 30, 70)])], duplex_flip="short")
+    assert _edges(result) == [(1, 1, "back", 2, "fold")]
+    assert result["violations"][0]["rectangle"] == {
+        "x_mm": 70.0, "y_mm": 10.0, "width_mm": 30.0, "height_mm": 70.0,
+    }
+    # 右槽第 3 页：页内 (10,20,30,70) -> 纸面 (60+100,10,30,70)=(160,10,30,70)
+    result = _trim([(3, [(10, 20, 30, 70)])], duplex_flip="short")
+    # 右槽看左缘朝折缝：纸面左缘 160，折缝安全线 105，160 >= 105 合格
+    assert result["violations"] == []
+
+
+def test_long_flip_back_left_right_swap_layout():
+    # 长边背面左右互换：实际左槽 = 第 3 页、右槽 = 第 2 页（无中缝）
+    # 第 3 页页内 0..5 -> 纸面左槽 0..5，越外侧
+    result = _trim([(3, [(0, 50, 5, 10)])])
+    assert _edges(result) == [(1, 1, "back", 3, "outer")]
+    # 第 2 页页内 95..100 -> 纸面右槽 195..200，越过右外侧线 190
+    result = _trim([(2, [(95, 50, 5, 10)])])
+    assert _edges(result) == [(1, 1, "back", 2, "outer")]
+    rect = result["violations"][0]["rectangle"]
+    assert rect == {"x_mm": 195.0, "y_mm": 50.0, "width_mm": 5.0, "height_mm": 10.0}
+
+
+def test_right_binding_long_back_swap():
+    # 右装订拼版背面 (3,2)；long 互换后实际左槽 = 2、右槽 = 3
+    result = _trim([(2, [(0, 50, 5, 10)])], binding="right")
+    assert _edges(result) == [(1, 1, "back", 2, "outer")]
+    result = _trim([(3, [(0, 50, 5, 10)])], binding="right")
+    # 第 3 页在实际右槽：页内 0..5 -> 纸面 100..105，越折缝
+    assert _edges(result) == [(1, 1, "back", 3, "fold")]
+
+
 def test_invalid_duplex_flip_raises():
     with pytest.raises(ValueError):
         _trim([], duplex_flip="side")

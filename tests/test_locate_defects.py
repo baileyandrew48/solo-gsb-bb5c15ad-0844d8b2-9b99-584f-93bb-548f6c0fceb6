@@ -202,3 +202,49 @@ def test_response_echoes_layout_parameters():
     assert result["gutter_mm"] == 10.0
     assert result["duplex_flip"] == "long"
     assert result["binding"] == "left"
+
+
+def test_short_flip_back_paper_corners_boundaries():
+    # 页位边界回归：short 背面（无中缝，纸面 420×297）四角逆转 180° 后均落在页内。
+    # 槽位分界 x=210 属于右槽（无中缝区间）；背左 = 第 2 页、背右 = 第 3 页。
+    result = _locate(
+        [
+            (1, 1, "back", 0.0, 0.0),       # 背左槽左上角 -> 第 2 页阅读方向右下角
+            (1, 1, "back", 209.999, 0.0),   # 背左槽内
+            (1, 1, "back", 210.0, 0.0),     # 分界点进入背右槽
+            (1, 1, "back", 420.0, 297.0),   # 纸面右下角 -> 第 3 页阅读方向左上角
+        ],
+        gutter_mm=0.0,
+        duplex_flip="short",
+    )
+    d1, d2, d3, d4 = result["defects"]
+    assert (d1["page"], d1["page_x_mm"], d1["page_y_mm"]) == (2, 210.0, 297.0)
+    assert d2["page"] == 2
+    assert (d3["page"], d3["page_x_mm"], d3["page_y_mm"]) == (3, 210.0, 297.0)
+    assert (d4["page"], d4["page_x_mm"], d4["page_y_mm"]) == (3, 0.0, 0.0)
+
+
+def test_long_flip_back_slot_swap_boundaries():
+    # 长边背面左右互换边界：左槽 = 第 3 页、右槽 = 第 2 页，中缝 [210,220)
+    result = _locate(
+        [
+            (1, 1, "back", 0.0, 0.0),       # 交换后左槽第 3 页页内左上角
+            (1, 1, "back", 209.999, 0.0),   # 左槽内
+            (1, 1, "back", 210.0, 0.0),     # 中缝起点
+            (1, 1, "back", 219.999, 0.0),   # 中缝末点前
+            (1, 1, "back", 220.0, 0.0),     # 右槽起点：交换后第 2 页页内左上角
+            (1, 1, "back", 430.0, 297.0),   # 纸面右下角：第 2 页页内右下角
+        ],
+    )
+    locations = [(d["location"], d["page"]) for d in result["defects"]]
+    assert locations == [
+        ("page", 3),
+        ("page", 3),
+        ("gutter", None),
+        ("gutter", None),
+        ("page", 2),
+        ("page", 2),
+    ]
+    first, last = result["defects"][0], result["defects"][-1]
+    assert (first["page_x_mm"], first["page_y_mm"]) == (0.0, 0.0)
+    assert (last["page_x_mm"], last["page_y_mm"]) == (210.0, 297.0)

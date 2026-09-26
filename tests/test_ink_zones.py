@@ -290,6 +290,45 @@ def test_non_finite_rect_values_raise():
             _ink([(1, [rect])])
 
 
+def test_short_flip_back_asymmetric_rect_keeps_dimensions():
+    # 短边背面非对称矩形回归：宽 30、高 70 的矩形 180° 映射后宽高不交换。
+    # 纸面 200、2 墨区每区 100；背左 = 第 2 页（x=0、180°）。
+    # 页内 (10,20,30,70) -> 纸面 (60,10,30,70)，面积 2100，K=1，印数 1
+    result = _ink(
+        [(2, [(10, 20, 30, 70, 0.0, 0.0, 0.0, 1.0)])],
+        zone_count=2,
+        copies=1,
+        duplex_flip="short",
+    )
+    back = _zones(result)["back"]
+    assert list(back) == [1]
+    assert back[1]["black_mm2"] == 2100.0
+    # 右槽第 3 页同样：页内 (10,20,30,70) -> 纸面 (100+60,10,30,70)=160..190，落区 2
+    result = _ink(
+        [(3, [(10, 20, 30, 70, 0.0, 0.0, 0.0, 1.0)])],
+        zone_count=2,
+        copies=1,
+        duplex_flip="short",
+    )
+    back = _zones(result)["back"]
+    assert list(back) == [2]
+    assert back[2]["black_mm2"] == 2100.0
+
+
+def test_short_flip_back_full_page_rect_fills_slot_zones():
+    # 整页贴边矩形在 180° 下仍铺满整个槽位（外接框不变）：纸面 200、2 墨区，
+    # 背左第 2 页整页 -> 纸面 0..100，两个墨区各 100×100=10000
+    result = _ink(
+        [(2, [(0, 0, 100, 100, 1.0, 0.0, 0.0, 0.0)])],
+        zone_count=2,
+        copies=1,
+        duplex_flip="short",
+    )
+    back = _zones(result)["back"]
+    assert set(back) == {1}
+    assert back[1]["cyan_mm2"] == 10000.0
+
+
 def test_invalid_duplex_flip_raises():
     with pytest.raises(ValueError):
         _ink([], duplex_flip="side")
