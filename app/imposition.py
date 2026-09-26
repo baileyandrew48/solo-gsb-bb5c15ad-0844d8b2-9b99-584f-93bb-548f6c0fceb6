@@ -108,10 +108,168 @@ def impose(total_pages: int, max_sheets: int, binding: Binding) -> List[dict]:
 
 
 # ---------------------------------------------------------------------------
-# 机台版面（press-layout）：拼版结果叠加纸面尺寸、页位坐标与双面翻转
+# 页位几何（press geometry）：由装订方向（经 impose 页序）、长/短边翻转与
+# 实际槽位统一确定页码、槽位原点与 0°/180° 旋转，并提供页内 ↔ 纸面的
+# 双向坐标变换。press-layout 生成页位、locate-defects 反查纸面点、
+# ink-zones 与 trim-safety 映射页内矩形都共用本节的同一套规则，
+# 避免各处独立计算产生坐标分歧。
 # ---------------------------------------------------------------------------
 
 DuplexFlip = Literal["long", "short"]
+Side = Literal["front", "back"]
+Slot = Literal["left", "right"]
+
+# 纸面 x 坐标的落点分区：左槽 / 中缝 / 右槽
+SlotRegion = Literal["left", "gutter", "right"]
+
+# 正反面与左右槽的固定遍历顺序（各接口共用，保证输出顺序一致）
+SIDES: Tuple[Side, Side] = ("front", "back")
+SLOTS: Tuple[Slot, Slot] = ("left", "right")
+
+
+class SlotGeometry:
+    """单个页位的页内 ↔ 纸面双向坐标变换。
+
+    页位与槽位等大（页宽 × 页高）：``origin_x`` / ``origin_y`` 为页位未旋转时
+    左上角在纸面的坐标（即槽位原点），``rotation_deg`` 为绕页位中心的旋转角
+    （0 或 180）。0°/180° 旋转都不改变外接框，故旋转前后槽位原点不变；
+    180° 旋转是对合变换（自身即逆），正向映射与反向还原共用同一组公式。
+    """
+
+    __slots__ = (
+        "origin_x",
+        "origin_y",
+        "rotation_deg",
+        "page_width_mm",
+        "page_height_mm",
+    )
+
+    def __init__(
+        self,
+        origin_x: float,
+        origin_y: float,
+        rotation_deg: int,
+        page_width_mm: float,
+        page_height_mm: float,
+    ) -> None:
+        self.origin_x = origin_x
+        self.origin_y = origin_y
+        self.rotation_deg = rotation_deg
+        self.page_width_mm = page_width_mm
+        self.page_height_mm = page_height_mm
+
+    def point_to_paper(self, x_mm: float, y_mm: float) -> Tuple[float, float]:
+        """页内（阅读方向）点映射到纸面坐标。"""
+        if self.rotation_deg == 180:
+            return (
+                self.origin_x + self.page_width_mm - x_mm,
+                self.origin_y + self.page_height_mm - y_mm,
+            )
+        return (self.origin_x + x_mm, self.origin_y + y_mm)
+
+    def point_to_page(self, x_mm: float, y_mm: float) -> Tuple[float, float]:
+        """纸面点还原为页内（阅读方向）坐标，即 :meth:`point_to_paper` 的逆。"""
+        dx = x_mm - self.origin_x
+        dy = y_mm - self.origin_y
+        if self.rotation_deg == 180:
+            return (self.page_width_mm - dx, self.page_height_mm - dy)
+        return (dx, dy)
+
+    def rect_to_paper(
+        self, x_mm: float, y_mm: float, width_mm: float, height_mm: float
+    ) -> Tuple[float, float, float, float]:
+        """页内（阅读方向）矩形映射到纸面，返回 ``(左上角 x, 左上角 y, 宽, 高)``。
+
+        0°/180° 旋转不改变矩形宽高：0° 时纸面左上角 = 槽位原点 + 页内左上角；
+        180° 时页内右下角映射为纸面左上角。
+        """
+        if self.rotation_deg == 180:
+            return (
+                self.origin_x + self.page_width_mm - x_mm - width_mm,
+                self.origin_y + self.page_height_mm - y_mm - height_mm,
+                width_mm,
+                height_mm,
+            )
+        return (self.origin_x + x_mm, self.origin_y + y_mm, width_mm, height_mm)
+
+
+class PressGeometry:
+    """机台版面几何：纸面尺寸、槽位原点、各面旋转角与页码归属的统一规则。
+
+    由页宽、页高、中缝与双面翻转方式构造；页码取自 :func:`impose` 的拼版
+    结果（装订方向已体现在其中），长边翻转（``long``）的背面左右槽互换、
+    短边翻转（``short``）的背面保持槽位并旋转 180°。
+    """
+
+    def __init__(
+        self,
+        page_width_mm: float,
+        page_height_mm: float,
+        gutter_mm: float,
+        duplex_flip: DuplexFlip,
+    ) -> None:
+        if duplex_flip not in ("long", "short"):
+            raise ValueError(
+                f"非法双面翻转模式：{duplex_flip!r}，只支持 'long' / 'short'"
+            )
+        self.page_width_mm = page_width_mm
+        self.page_height_mm = page_height_mm
+        self.gutter_mm = gutter_mm
+        self.duplex_flip = duplex_flip
+        self.paper_width_mm = 2 * page_width_mm + gutter_mm
+        self.paper_height_mm = page_height_mm
+        # 右槽原点 x = 页宽 + 中缝；左槽原点恒为 (0, 0)
+        self.right_slot_x = page_width_mm + gutter_mm
+
+    def rotation_deg(self, side: Side) -> int:
+        """某面页位绕页位中心的旋转角：正面恒为 0；背面 long 为 0、short 为 180。"""
+        if side == "back" and self.duplex_flip == "short":
+            return 180
+        return 0
+
+    def slot_origin(self, slot: Slot) -> Tuple[float, float]:
+        """槽位原点（页位未旋转时左上角的纸面坐标）：左槽 (0, 0)、右槽 (页宽+中缝, 0)。"""
+        if slot == "left":
+            return (0.0, 0.0)
+        return (self.right_slot_x, 0.0)
+
+    def slot_geometry(self, side: Side, slot: Slot) -> SlotGeometry:
+        """某面某槽位的双向坐标变换。"""
+        origin_x, origin_y = self.slot_origin(slot)
+        return SlotGeometry(
+            origin_x,
+            origin_y,
+            self.rotation_deg(side),
+            self.page_width_mm,
+            self.page_height_mm,
+        )
+
+    def page_at(self, sheet: dict, side: Side, slot: Slot) -> Optional[int]:
+        """某张某面某槽位上的页码（空白页位为 ``None``）。
+
+        ``sheet`` 为 :func:`impose_signature` 结果中的一项；长边翻转的背面
+        左右槽互换（页码随新槽位），短边翻转保持槽位。
+        """
+        if side == "back" and self.duplex_flip == "long":
+            slot = "right" if slot == "left" else "left"
+        return sheet[side][slot]
+
+    def slot_at(self, x_mm: float) -> SlotRegion:
+        """纸面 x 坐标的落点分区：左槽 / 中缝（``gutter``）/ 右槽。
+
+        左槽 ``x < 页宽``，中缝 ``页宽 ≤ x < 页宽 + 中缝``（中缝为 0 时该区间
+        为空，不会命中），其余为右槽；调用方需先确认坐标在纸面范围内。
+        """
+        if x_mm < self.page_width_mm:
+            return "left"
+        if x_mm < self.right_slot_x:
+            return "gutter"
+        return "right"
+
+
+# ---------------------------------------------------------------------------
+# 机台版面（press-layout）：拼版结果叠加纸面尺寸、页位坐标与双面翻转
+# ---------------------------------------------------------------------------
 
 
 def press_layout(
@@ -125,7 +283,8 @@ def press_layout(
 ) -> dict:
     """在 :func:`impose` 的拼版结果上补充纸面尺寸与各页位坐标、旋转角。
 
-    沿用总页数 / 每帖最大张数 / 装订方向的分帖与正反面页序规则。纸面宽为
+    沿用总页数 / 每帖最大张数 / 装订方向的分帖与正反面页序规则；页码、槽位
+    原点与 0°/180° 旋转由 :class:`PressGeometry` 统一确定。纸面宽为
     ``2 × 页宽 + 中缝``，纸面高为页高。坐标以纸张左上角为原点：左槽 x=0、
     右槽 x=页宽+中缝，所有槽位 y=0。正面旋转角恒为 0；背面
 
@@ -134,56 +293,41 @@ def press_layout(
 
     空白页位整体返回 ``None``。非法翻转模式抛 ``ValueError``。
     """
-    if duplex_flip not in ("long", "short"):
-        raise ValueError(
-            f"非法双面翻转模式：{duplex_flip!r}，只支持 'long' / 'short'"
-        )
+    geometry = PressGeometry(page_width_mm, page_height_mm, gutter_mm, duplex_flip)
 
-    paper_width = 2 * page_width_mm + gutter_mm
-    paper_height = page_height_mm
-    right_slot_x = page_width_mm + gutter_mm
-    back_rotation = 0 if duplex_flip == "long" else 180
-
-    def placement(page: Optional[P], x: float, rotation: int) -> Optional[dict]:
-        # x/y 为页位（未旋转时）左上角；旋转绕页位中心，0°/180° 不改变外接框
+    def placement(page: Optional[int], slot: SlotGeometry) -> Optional[dict]:
+        # x/y 为页位（未旋转时）左上角，即槽位原点；旋转绕页位中心，
+        # 0°/180° 不改变外接框
         if page is None:
             return None
         return {
             "page": page,
-            "x_mm": x,
-            "y_mm": 0.0,
-            "rotation_deg": rotation,
+            "x_mm": slot.origin_x,
+            "y_mm": slot.origin_y,
+            "rotation_deg": slot.rotation_deg,
         }
 
     result_signatures: List[dict] = []
     for signature in impose(total_pages, max_sheets, binding):
         layout_sheets: List[dict] = []
         for sheet in signature["sheets"]:
-            back_left = sheet["back"]["left"]
-            back_right = sheet["back"]["right"]
-            if duplex_flip == "long":
-                # 长边翻转：背面左右槽交换
-                back_left, back_right = back_right, back_left
-            layout_sheets.append(
-                {
-                    "sheet_index": sheet["sheet_index"],
-                    "front": {
-                        "left": placement(sheet["front"]["left"], 0.0, 0),
-                        "right": placement(sheet["front"]["right"], right_slot_x, 0),
-                    },
-                    "back": {
-                        "left": placement(back_left, 0.0, back_rotation),
-                        "right": placement(back_right, right_slot_x, back_rotation),
-                    },
+            layout_sheet = {"sheet_index": sheet["sheet_index"]}
+            for side in SIDES:
+                layout_sheet[side] = {
+                    slot: placement(
+                        geometry.page_at(sheet, side, slot),
+                        geometry.slot_geometry(side, slot),
+                    )
+                    for slot in SLOTS
                 }
-            )
+            layout_sheets.append(layout_sheet)
         result_signatures.append(
             {
                 "signature_index": signature["signature_index"],
                 "sheet_count": signature["sheet_count"],
                 "page_count_padded": signature["page_count_padded"],
-                "paper_width_mm": paper_width,
-                "paper_height_mm": paper_height,
+                "paper_width_mm": geometry.paper_width_mm,
+                "paper_height_mm": geometry.paper_height_mm,
                 "sheets": layout_sheets,
             }
         )
@@ -196,8 +340,8 @@ def press_layout(
         "page_height_mm": page_height_mm,
         "gutter_mm": gutter_mm,
         "duplex_flip": duplex_flip,
-        "paper_width_mm": paper_width,
-        "paper_height_mm": paper_height,
+        "paper_width_mm": geometry.paper_width_mm,
+        "paper_height_mm": geometry.paper_height_mm,
         "signature_count": len(result_signatures),
         "signatures": result_signatures,
     }
@@ -206,8 +350,6 @@ def press_layout(
 # ---------------------------------------------------------------------------
 # 瑕疵定位（locate-defects）：纸面坐标反查原稿页码与阅读方向页内坐标
 # ---------------------------------------------------------------------------
-
-Side = Literal["front", "back"]
 
 # 单个瑕疵点：(帖号, 张号, 面, x_mm, y_mm)
 # 帖号/张号从 1 开始；面为 "front" 正面 / "back" 背面；
@@ -227,9 +369,10 @@ def locate_defects(
 ) -> dict:
     """把纸面上的瑕疵点反查为原稿页码与阅读方向的页内坐标。
 
-    页序、槽位与旋转规则完全沿用 :func:`press_layout`：正面与 ``long`` 背面
-    旋转 0°（``long`` 背面按交换后的槽位定位），``short`` 背面各页位绕自身
-    中心旋转 180°，槽内坐标需逆转 180° 还原为阅读方向。
+    页序、槽位与旋转规则由 :class:`PressGeometry` 统一确定（与
+    :func:`press_layout` 同源）：正面与 ``long`` 背面旋转 0°（``long``
+    背面按交换后的槽位定位），``short`` 背面各页位绕自身中心旋转 180°，
+    槽内坐标需逆转 180° 还原为阅读方向。
 
     逐点返回（按请求顺序，序号 ``defect_index`` 从 1 开始）：
 
@@ -241,19 +384,10 @@ def locate_defects(
     帖号/张号越界、面取值非法、坐标越出纸面（含负坐标与非有限值）时抛
     ``ValueError``。
     """
-    layout = press_layout(
-        total_pages,
-        max_sheets,
-        binding,
-        page_width_mm,
-        page_height_mm,
-        gutter_mm,
-        duplex_flip,
-    )
-    paper_width = layout["paper_width_mm"]
-    paper_height = layout["paper_height_mm"]
-    signatures = layout["signatures"]
-    gutter_end = page_width_mm + gutter_mm
+    geometry = PressGeometry(page_width_mm, page_height_mm, gutter_mm, duplex_flip)
+    signatures = impose(total_pages, max_sheets, binding)
+    paper_width = geometry.paper_width_mm
+    paper_height = geometry.paper_height_mm
 
     results: List[dict] = []
     for index, (signature_index, sheet_index, side, x_mm, y_mm) in enumerate(
@@ -284,33 +418,30 @@ def locate_defects(
             )
 
         sheet = sheets[sheet_index - 1]
-        pair = sheet[side]
-        if page_width_mm <= x_mm < gutter_end:
+        region = geometry.slot_at(x_mm)
+        if region == "gutter":
             # 中缝（gutter_mm = 0 时该区间为空，不会命中）
             item = {"location": "gutter", "page": None,
                     "page_x_mm": None, "page_y_mm": None}
+            results.append({"defect_index": index, **item})
+            continue
+        slot: Slot = region  # 已排除中缝，落点必在左右槽之一
+        page = geometry.page_at(sheet, side, slot)
+        if page is None:
+            # 空白页位（末帖补白）
+            item = {"location": "blank", "page": None,
+                    "page_x_mm": None, "page_y_mm": None}
         else:
-            slot = "left" if x_mm < page_width_mm else "right"
-            placement = pair[slot]
-            if placement is None:
-                # 空白页位（末帖补白）
-                item = {"location": "blank", "page": None,
-                        "page_x_mm": None, "page_y_mm": None}
-            else:
-                # 槽内坐标 -> 阅读方向页内坐标；180° 旋转绕页位中心逆转
-                dx = x_mm - placement["x_mm"]
-                dy = y_mm - placement["y_mm"]
-                if placement["rotation_deg"] == 180:
-                    page_x = page_width_mm - dx
-                    page_y = page_height_mm - dy
-                else:
-                    page_x, page_y = dx, dy
-                item = {
-                    "location": "page",
-                    "page": placement["page"],
-                    "page_x_mm": page_x,
-                    "page_y_mm": page_y,
-                }
+            # 槽内坐标 -> 阅读方向页内坐标；180° 旋转绕页位中心逆转
+            page_x, page_y = geometry.slot_geometry(side, slot).point_to_page(
+                x_mm, y_mm
+            )
+            item = {
+                "location": "page",
+                "page": page,
+                "page_x_mm": page_x,
+                "page_y_mm": page_y,
+            }
         results.append({"defect_index": index, **item})
 
     return {
@@ -379,8 +510,9 @@ def ink_zones(
 ) -> dict:
     """按等宽墨区统计各通道等效着墨面积（已乘印数）。
 
-    页序、分帖、槽位与旋转规则完全沿用 :func:`press_layout`。每个页内矩形
-    （以页面左上角为原点）先按所在页位的 ``rotation_deg`` 映射到纸面坐标：
+    页序、分帖、槽位与旋转规则由 :class:`PressGeometry` 统一确定（与
+    :func:`press_layout` 同源）。每个页内矩形（以页面左上角为原点）先按所在
+    页位的 ``rotation_deg`` 映射到纸面坐标：
 
     - 0°：纸面左上角 = 槽位左上角 + 矩形左上角，宽高不变；
     - 180°：绕页位中心旋转，纸面左上角 =
@@ -474,42 +606,30 @@ def ink_zones(
             validated.append((rx, ry, rw, rh, c, m, y_value, k))
         inks_by_page[page] = validated
 
-    layout = press_layout(
-        total_pages,
-        max_sheets,
-        binding,
-        page_width_mm,
-        page_height_mm,
-        gutter_mm,
-        duplex_flip,
-    )
-    paper_width = layout["paper_width_mm"]
-    paper_height = layout["paper_height_mm"]
+    geometry = PressGeometry(page_width_mm, page_height_mm, gutter_mm, duplex_flip)
+    paper_width = geometry.paper_width_mm
+    paper_height = geometry.paper_height_mm
     zone_width = paper_width / zone_count
 
     result_signatures: List[dict] = []
-    for signature in layout["signatures"]:
+    for signature in impose(total_pages, max_sheets, binding):
         result_sheets: List[dict] = []
         for sheet in signature["sheets"]:
             sides: dict = {}
-            for side in ("front", "back"):
+            for side in SIDES:
                 # totals[墨区索引] = [青, 品, 黄, 黑] 累计等效面积（未乘印数）
                 totals = [[0.0, 0.0, 0.0, 0.0] for _ in range(zone_count)]
-                for slot in ("left", "right"):
-                    placement = sheet[side][slot]
-                    if placement is None:
+                for slot in SLOTS:
+                    page = geometry.page_at(sheet, side, slot)
+                    if page is None:
                         continue  # 空白页位（末帖补白）不计
-                    rects = inks_by_page.get(placement["page"])
+                    rects = inks_by_page.get(page)
                     if not rects:
                         continue
-                    slot_x = placement["x_mm"]
+                    slot_geometry = geometry.slot_geometry(side, slot)
                     for rx, ry, rw, rh, c, m, y_value, k in rects:
-                        if placement["rotation_deg"] == 180:
-                            px = slot_x + page_width_mm - rx - rw
-                            py = page_height_mm - ry - rh
-                        else:
-                            px = slot_x + rx
-                            py = ry
+                        # 页内矩形随页位 0°/180° 映射到纸面（宽高不变）
+                        px, py, _, _ = slot_geometry.rect_to_paper(rx, ry, rw, rh)
                         first = max(0, int(math.floor(px / zone_width)))
                         last = min(
                             zone_count - 1,
@@ -602,9 +722,10 @@ def trim_safety(
 ) -> dict:
     """检查各页受保护内容矩形映射到纸面后是否越过裁切/折缝安全线。
 
-    页序、分帖、槽位与旋转规则完全沿用 :func:`press_layout`。请求按**实际页码**
-    给出**阅读方向**的页内受保护矩形（以页面左上角为原点），矩形先按所在页位的
-    ``rotation_deg`` 映射到纸面坐标（与 :func:`ink_zones` 相同的 0°/180° 映射）：
+    页序、分帖、槽位与旋转规则由 :class:`PressGeometry` 统一确定（与
+    :func:`press_layout` 同源）。请求按**实际页码**给出**阅读方向**的页内
+    受保护矩形（以页面左上角为原点），矩形先按所在页位的 ``rotation_deg``
+    映射到纸面坐标（与 :func:`ink_zones` 相同的 0°/180° 映射）：
 
     - 0°：纸面左上角 = 槽位左上角 + 矩形左上角，宽高不变；
     - 180°：绕页位中心旋转，纸面左上角 =
@@ -689,40 +810,28 @@ def trim_safety(
             validated.append((rx, ry, rw, rh))
         protected_by_page[page] = validated
 
-    layout = press_layout(
-        total_pages,
-        max_sheets,
-        binding,
-        page_width_mm,
-        page_height_mm,
-        gutter_mm,
-        duplex_flip,
-    )
-    paper_width = layout["paper_width_mm"]
-    paper_height = layout["paper_height_mm"]
+    geometry = PressGeometry(page_width_mm, page_height_mm, gutter_mm, duplex_flip)
+    paper_width = geometry.paper_width_mm
+    paper_height = geometry.paper_height_mm
     # 折缝线：纸面（中缝）中心线
     fold_x = paper_width / 2.0
     tolerance = 1e-9 * max(1.0, paper_width, paper_height)
 
     violations: List[dict] = []
-    for signature in layout["signatures"]:
+    for signature in impose(total_pages, max_sheets, binding):
         for sheet in signature["sheets"]:
-            for side in ("front", "back"):
-                for slot in ("left", "right"):
-                    placement = sheet[side][slot]
-                    if placement is None:
+            for side in SIDES:
+                for slot in SLOTS:
+                    page = geometry.page_at(sheet, side, slot)
+                    if page is None:
                         continue  # 空白页位（末帖补白）跳过
-                    rects = protected_by_page.get(placement["page"])
+                    rects = protected_by_page.get(page)
                     if not rects:
                         continue
-                    slot_x = placement["x_mm"]
+                    slot_geometry = geometry.slot_geometry(side, slot)
                     for rx, ry, rw, rh in rects:
-                        if placement["rotation_deg"] == 180:
-                            px = slot_x + page_width_mm - rx - rw
-                            py = page_height_mm - ry - rh
-                        else:
-                            px = slot_x + rx
-                            py = ry
+                        # 页内矩形随页位 0°/180° 映射到纸面（宽高不变）
+                        px, py, rw, rh = slot_geometry.rect_to_paper(rx, ry, rw, rh)
                         # 追加顺序与 TRIM_EDGE_ORDER 一致（top,bottom,outer,fold）
                         crossed: List[str] = []
                         if py < outer_trim_mm - tolerance:
@@ -747,7 +856,7 @@ def trim_safety(
                                     "signature_index": signature["signature_index"],
                                     "sheet_index": sheet["sheet_index"],
                                     "side": side,
-                                    "page": placement["page"],
+                                    "page": page,
                                     "edge": edge,
                                     "rectangle": {
                                         "x_mm": px,

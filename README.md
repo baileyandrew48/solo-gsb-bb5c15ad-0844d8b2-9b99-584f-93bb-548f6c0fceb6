@@ -60,10 +60,14 @@
 需要安装 Docker（含 Compose 插件），在项目根目录执行：
 
 ```bash
-docker compose up -d --build
+docker compose up --build
 ```
 
 该命令会自动完成：构建镜像 → 安装全部依赖 → 启动 API（容器内 uvicorn 直接拉起，无数据库等额外初始化步骤）。
+加 `-d` 可后台运行（`docker compose up -d --build`）。
+
+启动后 API 地址为 `http://localhost:8000`（交互式文档 `http://localhost:8000/docs`）；
+宿主机端口可用 `HOST_PORT` 环境变量覆盖（容器内固定 8000），详见下文「必要配置」与「API 地址与端口」。
 
 停止 / 查看日志：
 
@@ -77,7 +81,7 @@ docker compose logs -f     # 查看日志
 默认无需任何配置。唯一可选配置是**宿主机端口**（容器内固定 8000）：
 
 ```bash
-HOST_PORT=9000 docker compose up -d --build
+HOST_PORT=9000 docker compose up --build
 ```
 
 | 配置项 | 默认值 | 说明 |
@@ -215,6 +219,10 @@ curl -X POST http://localhost:8000/api/v1/impose/press-layout \
 ```
 
 ### 坐标与翻转规则
+
+页码、槽位原点与 0°/180° 旋转由装订方向、长/短边翻转与实际槽位唯一确定；
+机台版面、瑕疵定位、墨区着墨面积与外裁/折缝安全检查四个接口共用这同一套
+页位几何规则（页内 ↔ 纸面的双向坐标变换），坐标不会因接口不同而产生分歧。
 
 - **纸面尺寸**：每张纸的纸面宽 `paper_width_mm = 2 × page_width_mm + gutter_mm`
   （两倍页宽加中缝），纸面高 `paper_height_mm = page_height_mm`（等于页高）；
@@ -666,7 +674,7 @@ curl -X POST http://localhost:8000/api/v1/impose/proof.pdf \
   -o proof.pdf
 ```
 
-启动服务后（`docker compose up -d --build`），在浏览器打开
+启动服务后（`docker compose up --build`），在浏览器打开
 <http://localhost:8000/docs>，找到 **“双面拼版校样：下载 proof.pdf”**，
 点击 **Try it out** 填入参数后 **Execute**，也可直接下载 `proof.pdf`；
 健康检查地址为 <http://localhost:8000/health>。
